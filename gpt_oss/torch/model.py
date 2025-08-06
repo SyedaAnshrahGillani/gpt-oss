@@ -23,6 +23,7 @@ class ModelConfig:
     num_key_value_heads: int = 8
     sliding_window: int = 128
     initial_context_length: int = 4096
+    max_context_length: int = 131072
     rope_theta: float = 150000.0
     rope_scaling_factor: float = 32.0
     rope_ntk_alpha: float = 1.0
@@ -70,6 +71,7 @@ class RotaryEmbedding(torch.nn.Module):
         scaling_factor: float = 1.0,
         ntk_alpha: float = 1.0,
         ntk_beta: float = 32.0,
+        max_context_length: int = 131072,
         device: torch.device | None = None,
     ) -> None:
         super().__init__()
@@ -81,6 +83,8 @@ class RotaryEmbedding(torch.nn.Module):
         self.ntk_alpha = ntk_alpha
         self.ntk_beta = ntk_beta
         self.device = device
+        self.max_context_length = max_context_length
+        self.cos, self.sin = self._compute_cos_sin(0, self.max_context_length)
 
     def _compute_concentration_and_inv_freq(self) -> torch.Tensor:
         """See YaRN paper: https://arxiv.org/abs/2309.00071"""
@@ -122,21 +126,38 @@ class RotaryEmbedding(torch.nn.Module):
 
         return concentration, inv_freq
 
-    def _compute_cos_sin(self, num_tokens: int):
+    def _compute_cos_sin(self, start: int, num_tokens: int):
         concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
+        t = torch.arange(start, start + num_tokens, dtype=torch.float32, device=self.device)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
         return cos, sin
 
+    def _rotate(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        cos = cos[None, :, None, :].to(x.dtype)
+        sin = sin[None, :, None, :].to(x.dtype)
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.cat((o1, o2), dim=-1)
+
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        offset: torch.LongTensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        idx = torch.arange(num_tokens, device=query.device, dtype=torch.long) + offset
+        idx = idx % self.max_context_length
+        cos = self.cos.index_select(0, idx)
+        sin = self.sin.index_select(0, idx)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_dim)
@@ -148,6 +169,42 @@ class RotaryEmbedding(torch.nn.Module):
         key = _apply_rotary_emb(key, cos, sin)
         key = key.reshape(key_shape)
         return query, key
+
+
+class Cache:
+    def __init__(self, batch_size, n_ctx, n_kv_heads, d_head=64, device: torch.device | None = None):
+        self.k = torch.zeros((batch_size, n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
+        self.v = torch.zeros((batch_size, n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
+        self.offset = torch.zeros((1,), dtype=torch.long, device=device)
+
+    def reset(self):
+        self.k.zero_()
+        self.v.zero_()
+        self.offset.zero_()
+
+    def repeat_interleave(self, n):
+        """Repeat each cache entry n times along the batch dimension."""
+        self.k = self.k.repeat_interleave(n, dim=0)
+        self.v = self.v.repeat_interleave(n, dim=0)
+
+    def truncate(self, n_ctx):
+        """Truncate the cache to the first n_ctx tokens."""
+        batch_size, _, n_kv_heads, d_head = self.k.shape
+        assert batch_size == self.v.shape[0]
+        assert n_ctx <= self.k.shape[1]
+        self.k[:, n_ctx:, :, :].zero_()
+        self.v[:, n_ctx:, :, :].zero_()
+        self.offset.fill_(n_ctx)
+        return self.k, self.v
+
+    def extend(self, k, v):
+        batch_size, n_ctx, *_rest = k.shape
+        assert batch_size == self.k.shape[0]
+        indices = torch.arange(0, n_ctx, device=k.device, dtype=torch.long) + self.offset
+        self.k.index_copy_(1, indices, k)
+        self.v.index_copy_(1, indices, v)
+        self.offset.add_(n_ctx)
+        return self.k, self.v
 
 
 def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
@@ -211,10 +268,11 @@ class AttentionBlock(torch.nn.Module):
             scaling_factor=config.rope_scaling_factor,
             ntk_alpha=config.rope_ntk_alpha,
             ntk_beta=config.rope_ntk_beta,
+            max_context_length=config.max_context_length,
             device=device,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: Cache | None = None) -> torch.Tensor:
         t = self.norm(x)
         qkv = self.qkv(t)
         q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
@@ -239,7 +297,14 @@ class AttentionBlock(torch.nn.Module):
         )
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
+
+        if cache is not None:
+            offset = cache.offset.clone()
+            q, k = self.rope(q, k, offset=offset)
+            k, v = cache.extend(k, v)
+        else:
+            offset = torch.zeros((1,), dtype=torch.long, device=x.device)
+            q, k = self.rope(q, k, offset=offset)
         t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
         t = self.out(t)
         t = x + t
@@ -348,8 +413,8 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x)
+    def forward(self, x: torch.Tensor, cache: Cache | None = None) -> torch.Tensor:
+        x = self.attn(x, cache=cache)
         x = self.mlp(x)
         return x
 
@@ -361,6 +426,7 @@ class Transformer(torch.nn.Module):
         device: torch.device | None = None,
     ):
         super().__init__()
+        self.config = config
         self.embedding = torch.nn.Embedding(
             config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
         )
@@ -379,91 +445,97 @@ class Transformer(torch.nn.Module):
             dtype=torch.bfloat16,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
-        for block in self.block:
-            x = block(x)
-        x = self.norm(x)
-        x = self.unembedding(x)
-        return x
+    def forward(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
+        caches=caches or [None] * len(self.block)
+        with record_function("embedding"):
+            x = self.embedding(x)
+        for block, cache in zip(self.block, caches):
+            with record_function("block"):
+                x = block(x, cache=cache)
+        with record_function("norm_f"):
+            x = self.norm(x)
+        with record_function("unembedding"):
+            x = self.unembedding(x)
+        return x.float()
 
     @staticmethod
     def from_checkpoint(
-        path: str, device: str | torch.device = "cuda"
+        path: str, config: ModelConfig | None = None, device: str | torch.device = "cuda",
     ) -> "Transformer":
         if not isinstance(device, torch.device):
             device = torch.device(device)
 
-        config_path = os.path.join(path, "config.json")
-        with open(config_path, "r") as f:
-            json_config = json.load(f)
-            config = ModelConfig(**json_config)
+        if config is None:
+            config_path = os.path.join(path, "config.json")
+            with open(config_path, "r") as f:
+                json_config = json.load(f)
+                config = ModelConfig(**json_config)
 
-        model = Transformer(
-            config=config,
-            device=device,
-        )
+        model = Transformer(config=config, device=device)
         model.eval()
-
-        # Load weights
-        my_rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        per_rank_intermediate_size = config.intermediate_size // world_size
 
         checkpoint = Checkpoint(path, device)
 
         for name, param in model.named_parameters():
+            torch.cuda.empty_cache()
             loaded_tensor = checkpoint.get(name)
 
-            # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-            # but for simplicity we do it after.
-            if "mlp1" in name:  # both weight and bias
-                loaded_tensor = loaded_tensor[
-                    :,
-                    my_rank * 2
-                    * per_rank_intermediate_size : (my_rank + 1) * 2
-                    * per_rank_intermediate_size,
-                    ...,
-                ]
-            elif "mlp2_weight" in name:  # only weight
-                loaded_tensor = loaded_tensor[
-                    ...,
-                    my_rank
-                    * per_rank_intermediate_size : (my_rank + 1)
-                    * per_rank_intermediate_size,
-                ]
-            try:
-                param.data.copy_(loaded_tensor)
-            except:
-                print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-                raise
+            if "mlp1" in name:
+                if "weight" in name:
+                    loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
+                    _, block_index, _, _ = name.split(".")
+                    model.block[int(block_index)].mlp.mlp1_weight_mx = scales
+                    param.data.copy_(loaded_tensor.storage.data)
+                else:
+                    param.data.copy_(loaded_tensor)
 
+            elif "mlp2_weight" in name:
+                loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
+                _, block_index, _, _ = name.split(".")
+                model.block[int(block_index)].mlp.mlp2_weight_mx = scales
+                param.data.copy_(loaded_tensor.storage.data)
+
+            elif "gate" in name and loaded_tensor.ndim == 2:
+                loaded_tensor = loaded_tensor.mT.contiguous()
+                param.data.copy_(loaded_tensor)
+
+            else:
+                param.data.copy_(loaded_tensor)
+
+        # NOTE: Required to avoid OOM errors
+        torch.cuda.empty_cache()
         return model
 
 
 class TokenGenerator:
     @torch.inference_mode()
-    def __init__(self, checkpoint: str, device: torch.device):
+    def __init__(self, checkpoint: str, context: int, device: torch.device):
         self.device = device
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+        self.caches = [Cache(1, context, self.model.config.num_key_value_heads, device=self.device) for _ in range(len(self.model.block))]
+        self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
 
     @torch.inference_mode()
     def generate(self,
                  prompt_tokens: list[int],
-                 stop_tokens: list[int],
+                 stop_tokens: list[int] | None = None,
                  temperature: float = 1.0,
                  max_tokens: int = 0,
                  return_logprobs: bool = False):
-        tokens = list(prompt_tokens)
+        stop_tokens = stop_tokens or []
+        for cache in self.caches:
+            cache.reset()
+        prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
+        self.model(prompt_tokens[None, :-1], self.caches)
+        predicted_token = prompt_tokens[-1]
         num_generated_tokens = 0
         while max_tokens == 0 or num_generated_tokens < max_tokens:
-            logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
+            logits = self.model(self.input_token[None, :], self.caches)[0]
             if temperature == 0.0:
                 predicted_token = torch.argmax(logits, dim=-1).item()
             else:
                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
                 predicted_token = torch.multinomial(probs, num_samples=1).item()
-            tokens.append(predicted_token)
             num_generated_tokens += 1
 
             if return_logprobs:
