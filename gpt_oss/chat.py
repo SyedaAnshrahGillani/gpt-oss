@@ -198,7 +198,7 @@ def main(args):
                         _, text = some_dict.popitem()
                     except Exception as e:
                         tool_output = f"Error parsing JSON: {e}"
-
+                
                 if tool_output is None:
                     try:
                         tool_output = apply_patch.apply_patch(text)
