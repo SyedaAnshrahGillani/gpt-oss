@@ -604,7 +604,6 @@ def create_api_server(
                     # purely for debugging purposes
                     output_token_text = encoding.decode_utf8([next_tok])
                     self.output_text += output_token_text
-                    print(output_token_text, end="", flush=True)
 
                 except RuntimeError:
                     pass
@@ -703,7 +702,6 @@ def create_api_server(
                             ))
 
                             current_output_index += 1
-                            self.new_request = True
                             
                             continue
 
