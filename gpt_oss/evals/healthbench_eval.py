@@ -207,7 +207,7 @@ def _compute_clipped_stats(
         ]
         return np.std(bootstrap_means)
     else:
-        raise ValueError(f"Unknown {stat =}")
+        raise ValueError(f"Unknown {stat = }")
 
 
 def _aggregate_get_clipped_mean(
@@ -290,7 +290,7 @@ class HealthBenchEval(Eval):
             # subset to only the rows which have physician completions from that group
             examples_matching_mode = [
                 example
-                for example in examples
+                for example in copy.deepcopy(examples)
                 if example["ideal_completions_data"] is not None
                 and example["ideal_completions_data"]["ideal_completions_group"]
                 == self.physician_completions_mode
